@@ -1,0 +1,83 @@
+---
+# Haiggle Fleet — rollback.yml
+# Revert a school (or the whole fleet) to a previous image tag.
+# Usage:
+#   Fleet rollback:   ansible-playbook playbooks/rollback.yml -e "version=v1.4.2"
+#   Single school:    ansible-playbook playbooks/rollback.yml -e "version=v1.4.2 school=ccf"
+#
+# Rollback does NOT run migrations — it assumes the previous image
+# is compatible with the current schema (forward-compatible migration policy).
+# If a schema change must also be rolled back, do it as a separate migration.
+
+- name: Rollback Haiggle to previous version
+  hosts: "{{ school | default('production') }}"
+  become: true
+  serial: "{{ serial | default(10) }}"
+
+  vars:
+    app_dir: /srv/haiggle
+    rollback_tag: "{{ version }}"   # Required — passed via -e
+    rollback_image: "{{ docker_image }}:{{ rollback_tag }}"
+
+  tasks:
+    - name: Verify rollback image exists in registry
+      community.docker.docker_image:
+        name: "{{ docker_image }}"
+        tag: "{{ rollback_tag }}"
+        source: pull
+      register: pull_result
+
+    - name: Stop current app container
+      community.docker.docker_container:
+        name: haiggle-app
+        state: stopped
+
+    - name: Start app with rollback image
+      community.docker.docker_container:
+        name: haiggle-app
+        image: "{{ rollback_image }}"
+        env_file: "{{ app_dir }}/.env"
+        volumes:
+          - haiggle_storage:/var/www/html/storage/app
+          - haiggle_logs:/var/www/html/storage/logs
+        networks:
+          - name: haiggle
+        restart_policy: unless-stopped
+        state: started
+        force_kill: true
+
+    - name: Wait for rollback app to become healthy
+      ansible.builtin.command:
+        cmd: "docker inspect --format='{{ '{{' }}.State.Health.Status{{ '}}' }}' haiggle-app"
+      register: health
+      retries: 12
+      delay: 5
+      until: health.stdout == "healthy"
+      changed_when: false
+
+    - name: Verify health endpoint post-rollback
+      ansible.builtin.uri:
+        url: "https://{{ school_domain }}/api/health"
+        status_code: 200
+        validate_certs: true
+
+    - name: Record rolled-back version
+      ansible.builtin.copy:
+        content: "{{ rollback_tag }}"
+        dest: "{{ app_dir }}/.deployed-version"
+        mode: "0644"
+
+    - name: Remove deploy:failed flag from monitoring Redis (if present)
+      ansible.builtin.command:
+        cmd: "redis-cli -h {{ monitoring_redis_host }} -p 6379 SREM deploy:failed {{ inventory_hostname }}"
+      delegate_to: localhost
+      ignore_errors: true
+      when: monitoring_redis_host is defined
+
+    - name: Notify Slack — rollback complete
+      community.general.slack:
+        token: "{{ slack_token }}"
+        channel: "#ops"
+        msg: |
+          :rewind: *Rolled back* `{{ inventory_hostname }}` ({{ school_domain }}) to `{{ rollback_tag }}`
+      when: slack_token is defined

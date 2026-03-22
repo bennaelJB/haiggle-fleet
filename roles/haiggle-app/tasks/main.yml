@@ -1,0 +1,90 @@
+---
+# roles/haiggle-app/tasks/main.yml
+# Set up the Haiggle application: directories, env file, Docker Compose stack,
+# initial migrations, and storage link.
+
+- name: Create app directory structure
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ deploy_user | default('deploy') }}"
+    group: "{{ deploy_user | default('deploy') }}"
+    mode: "0750"
+  loop:
+    - /srv/haiggle
+    - /srv/haiggle/data/postgres
+    - /srv/haiggle/data/redis
+    - /srv/haiggle/data/minio
+    - /srv/haiggle/logs
+
+- name: Deploy docker-compose.yml from template
+  ansible.builtin.template:
+    src: docker-compose.prod.yml.j2
+    dest: /srv/haiggle/docker-compose.yml
+    owner: "{{ deploy_user | default('deploy') }}"
+    group: "{{ deploy_user | default('deploy') }}"
+    mode: "0640"
+
+- name: Deploy .env from template
+  ansible.builtin.template:
+    src: .env.j2
+    dest: /srv/haiggle/.env
+    owner: "{{ deploy_user | default('deploy') }}"
+    group: "{{ deploy_user | default('deploy') }}"
+    mode: "0600"
+
+- name: Log in to GitHub Container Registry
+  community.docker.docker_login:
+    registry_url: ghcr.io
+    username: "{{ ghcr_username }}"
+    password: "{{ ghcr_token }}"
+  become: true
+  become_user: "{{ deploy_user | default('deploy') }}"
+
+- name: Pull initial image
+  community.docker.docker_image:
+    name: "ghcr.io/{{ ghcr_org }}/haiggle-app:{{ image_tag | default('latest') }}"
+    source: pull
+  become: true
+  become_user: "{{ deploy_user | default('deploy') }}"
+
+- name: Start full stack
+  community.docker.docker_compose_v2:
+    project_src: /srv/haiggle
+    state: present
+    pull: missing
+  become: true
+  become_user: "{{ deploy_user | default('deploy') }}"
+
+- name: Run database migrations
+  community.docker.docker_container:
+    name: haiggle-migrate-init
+    image: "ghcr.io/{{ ghcr_org }}/haiggle-app:{{ image_tag | default('latest') }}"
+    command: php artisan migrate --force
+    env_file: /srv/haiggle/.env
+    networks:
+      - name: haiggle_default
+    auto_remove: true
+    detach: false
+  become: true
+  become_user: "{{ deploy_user | default('deploy') }}"
+
+- name: Create storage symlink
+  community.docker.docker_container:
+    name: haiggle-storage-link-init
+    image: "ghcr.io/{{ ghcr_org }}/haiggle-app:{{ image_tag | default('latest') }}"
+    command: php artisan storage:link
+    env_file: /srv/haiggle/.env
+    networks:
+      - name: haiggle_default
+    auto_remove: true
+    detach: false
+  become: true
+  become_user: "{{ deploy_user | default('deploy') }}"
+
+- name: Write initial deployed-version marker
+  ansible.builtin.copy:
+    dest: /srv/haiggle/.deployed-version
+    content: "{{ image_tag | default('latest') }}\n"
+    owner: "{{ deploy_user | default('deploy') }}"
+    mode: "0644"

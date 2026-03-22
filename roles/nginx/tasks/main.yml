@@ -1,0 +1,75 @@
+---
+# roles/nginx/tasks/main.yml
+# Install Nginx, obtain a Let's Encrypt certificate via Certbot, and
+# deploy the rendered nginx.conf for the school's domain.
+
+- name: Install Nginx + Certbot
+  ansible.builtin.apt:
+    name:
+      - nginx
+      - certbot
+      - python3-certbot-nginx
+    state: present
+    update_cache: true
+
+- name: Ensure Nginx is enabled and started
+  ansible.builtin.systemd:
+    name: nginx
+    enabled: true
+    state: started
+
+- name: Create webroot challenge directory for Certbot
+  ansible.builtin.file:
+    path: /var/www/letsencrypt/.well-known
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "0755"
+
+- name: Deploy temporary HTTP-only config for Certbot challenge
+  ansible.builtin.template:
+    src: nginx-certbot-bootstrap.conf.j2
+    dest: "/etc/nginx/sites-available/{{ school_domain }}"
+    mode: "0644"
+  notify: Reload Nginx
+
+- name: Enable temporary vhost
+  ansible.builtin.file:
+    src: "/etc/nginx/sites-available/{{ school_domain }}"
+    dest: "/etc/nginx/sites-enabled/{{ school_domain }}"
+    state: link
+  notify: Reload Nginx
+
+- name: Flush handlers (Nginx must be up before Certbot)
+  ansible.builtin.meta: flush_handlers
+
+- name: Obtain Let's Encrypt certificate
+  ansible.builtin.command: >
+    certbot certonly --webroot
+      -w /var/www/letsencrypt
+      -d {{ school_domain }}
+      --non-interactive --agree-tos
+      -m {{ letsencrypt_email }}
+  args:
+    creates: "/etc/letsencrypt/live/{{ school_domain }}/fullchain.pem"
+
+- name: Deploy final Nginx config (SSL + proxy)
+  ansible.builtin.template:
+    src: nginx.conf.j2
+    dest: "/etc/nginx/sites-available/{{ school_domain }}"
+    mode: "0644"
+  notify: Reload Nginx
+
+- name: Configure Certbot auto-renewal cron
+  ansible.builtin.cron:
+    name: certbot-renew
+    job: "certbot renew --quiet --post-hook 'systemctl reload nginx'"
+    minute: "30"
+    hour: "2"
+    weekday: "1"
+
+handlers:
+  - name: Reload Nginx
+    ansible.builtin.systemd:
+      name: nginx
+      state: reloaded

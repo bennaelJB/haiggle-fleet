@@ -1,0 +1,105 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Nginx configuration — rendered per school by Ansible provision.yml
+# Handles SSL termination, HSTS, CSP, and reverse proxy to the app container.
+# ─────────────────────────────────────────────────────────────────────────────
+
+server {
+    listen 80;
+    server_name {{ school_domain }};
+
+    # ACME challenge (Let's Encrypt HTTP-01)
+    location /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+    }
+
+    # Redirect all HTTP to HTTPS
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+upstream haiggle_app {
+    # Blue-green: during a deploy, this is swapped to point to app-next.
+    server haiggle-app:{{ app_port }};
+    keepalive 32;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name {{ school_domain }};
+
+    # ── SSL ──────────────────────────────────────────────────────────────────
+    ssl_certificate     /etc/letsencrypt/live/{{ school_domain }}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{{ school_domain }}/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # ── Security headers ─────────────────────────────────────────────────────
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Content-Security-Policy   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';" always;
+    add_header X-Frame-Options           "DENY" always;
+    add_header X-Content-Type-Options    "nosniff" always;
+    add_header Referrer-Policy           "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy        "camera=(), microphone=(), geolocation=()" always;
+
+    # ── Gzip compression ─────────────────────────────────────────────────────
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_types text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;
+
+    # ── Rate limiting ─────────────────────────────────────────────────────────
+    # Defined in nginx.conf http block; applied here.
+    limit_req_zone $binary_remote_addr zone=api:10m rate=30r/s;
+    limit_req zone=api burst=60 nodelay;
+
+    # ── Frontend static assets (served directly from the build artefact) ──────
+    root /var/www/haiggle/dist;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+        expires 1h;
+        add_header Cache-Control "public, max-age=3600";
+    }
+
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+    }
+
+    # ── API proxy to Laravel app container ───────────────────────────────────
+    location /api/ {
+        proxy_pass         http://haiggle_app;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   Connection        "";
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_buffer_size  8k;
+        client_max_body_size 20m;
+    }
+
+    location /sanctum/ {
+        proxy_pass         http://haiggle_app;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   Connection        "";
+    }
+
+    # ── Health check (open — no rate limit) ──────────────────────────────────
+    location = /api/health {
+        proxy_pass       http://haiggle_app;
+        proxy_set_header Host $host;
+        access_log       off;
+    }
+}

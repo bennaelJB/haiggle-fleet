@@ -1,0 +1,21 @@
+---
+# Haiggle Fleet — Per-School Temporary Training Instances
+# Auto-populated by the provision-training.yml playbook.
+# Auto-decommissioned after 14 days by scripts/decommission-training.sh.
+
+all:
+  vars:
+    deploy_group: training-temp
+    is_training: true
+    is_temporary: true
+    ttl_days: 14
+
+  hosts:
+    # Instances added dynamically by provision-training.yml:
+    # training_school_example:
+    #   ansible_host: 203.0.113.99
+    #   ansible_user: deploy
+    #   school_id: training_example
+    #   school_domain: training-example.haiggle.com
+    #   db_name: haiggle_training_example
+    #   created_at: "2026-03-22T10:00:00Z"

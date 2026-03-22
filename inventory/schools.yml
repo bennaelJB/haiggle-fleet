@@ -1,0 +1,68 @@
+---
+# Haiggle Fleet — School Inventory
+# Add each school under its appropriate group.
+# Canary schools receive updates first and serve as early-warning indicators.
+# Production schools receive updates only after canary monitoring passes.
+
+all:
+  vars:
+    # Application image repository
+    docker_registry: ghcr.io
+    docker_image: ghcr.io/your-org/haiggle
+    app_port: 8000
+    nginx_port: 443
+    # HMP instance registration endpoint
+    hmp_api_url: "{{ lookup('env', 'HMP_API_URL') }}"
+    hmp_token: "{{ lookup('env', 'HMP_MANAGEMENT_TOKEN') }}"
+    # Monitoring — Prometheus scrape target labels
+    prometheus_job: haiggle-schools
+    node_exporter_port: 9100
+    app_metrics_port: 8000
+
+  children:
+    canary:
+      # Schools that receive every release first.
+      # Choose schools whose admins are tech-savvy and can report issues quickly.
+      vars:
+        deploy_group: canary
+        canary_monitor_minutes: 30
+        error_rate_threshold: 0.02   # 2% — fail canary if exceeded
+
+      hosts:
+        # Example — replace with real school entries:
+        # school_demo:
+        #   ansible_host: 203.0.113.10
+        #   ansible_user: deploy
+        #   school_id: demo
+        #   school_domain: demo.haiggle.com
+        #   db_name: haiggle_demo
+
+    production:
+      # All non-canary schools.
+      # Updated serially (5 at a time) after canary gate passes.
+      vars:
+        deploy_group: production
+        serial: 5
+
+      hosts:
+        # Add production schools here:
+        # school_alphonse:
+        #   ansible_host: 203.0.113.20
+        #   ansible_user: deploy
+        #   school_id: alphonse
+        #   school_domain: alphonse.haiggle.com
+        #   db_name: haiggle_alphonse
+
+    training:
+      # Permanent shared training instance — NOT in production inventory.
+      vars:
+        deploy_group: training
+        is_training: true
+
+      hosts:
+        training_shared:
+          ansible_host: "{{ lookup('env', 'TRAINING_SERVER_IP') }}"
+          ansible_user: deploy
+          school_id: training
+          school_domain: training.haiggle.com
+          db_name: haiggle_training

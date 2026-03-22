@@ -1,0 +1,18 @@
+---
+# Haiggle Fleet — Staging Inventory
+# Single staging instance — auto-deployed on every merge to main.
+
+all:
+  vars:
+    deploy_group: staging
+    docker_registry: ghcr.io
+    docker_image: ghcr.io/your-org/haiggle
+    is_staging: true
+
+  hosts:
+    staging:
+      ansible_host: "{{ lookup('env', 'STAGING_SERVER_IP') }}"
+      ansible_user: deploy
+      school_id: staging
+      school_domain: staging.haiggle.com
+      db_name: haiggle_staging

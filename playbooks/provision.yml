@@ -1,0 +1,81 @@
+---
+# Haiggle Fleet — provision.yml
+# Provision a brand-new school VPS from scratch.
+# Usage: ansible-playbook playbooks/provision.yml -e "school=ccf image_tag=v1.2.0"
+#
+# What this playbook does:
+#   1. Install Docker + Docker Compose plugin
+#   2. Create /srv/haiggle directory structure and generate secrets
+#   3. Render docker-compose.prod.yml and .env from Jinja2 templates
+#   4. Pull the application image
+#   5. Run database migrations and initial seeder
+#   6. Configure Nginx + obtain Let's Encrypt SSL certificate
+#   7. Register this instance in HMP via API call
+#   8. Add the school to Prometheus monitoring
+
+- name: Provision Haiggle school instance
+  hosts: "{{ school | default('all') }}"
+  become: true
+  gather_facts: true
+
+  vars:
+    app_dir: /srv/haiggle
+    image_tag: "{{ image_tag | default('latest') }}"
+
+  pre_tasks:
+    - name: Ensure Python3 and pip are present
+      ansible.builtin.package:
+        name: [python3, python3-pip]
+        state: present
+        update_cache: true
+
+  roles:
+    - role: docker
+      tags: [docker]
+
+    - role: haiggle-app
+      tags: [app]
+
+    - role: nginx
+      tags: [nginx]
+
+    - role: monitoring
+      tags: [monitoring]
+
+  post_tasks:
+    - name: Wait for application to become healthy
+      ansible.builtin.uri:
+        url: "https://{{ school_domain }}/api/health"
+        status_code: 200
+        validate_certs: true
+      register: health_check
+      retries: 10
+      delay: 10
+      until: health_check.status == 200
+
+    - name: Register instance in HMP
+      ansible.builtin.uri:
+        url: "{{ hmp_api_url }}/api/instances"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ hmp_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          school_id: "{{ school_id }}"
+          domain: "{{ school_domain }}"
+          image_tag: "{{ image_tag }}"
+          plan: "{{ app_plan | default('base') }}"
+          provisioned_at: "{{ ansible_date_time.iso8601 }}"
+        status_code: [200, 201]
+      when: not (is_training | default(false))
+
+    - name: Notify Slack — provisioning complete
+      community.general.slack:
+        token: "{{ slack_token }}"
+        channel: "#ops"
+        msg: |
+          :white_check_mark: *Provisioned*: `{{ school_domain }}`
+          Image: `{{ image_tag }}`
+          Time: {{ ansible_date_time.iso8601 }}
+      when: slack_token is defined

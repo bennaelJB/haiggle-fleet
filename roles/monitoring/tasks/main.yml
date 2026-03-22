@@ -1,0 +1,78 @@
+---
+# roles/monitoring/tasks/main.yml
+# Deploy node-exporter (already in docker-compose.prod.yml.j2) and configure
+# the monitoring server to scrape this host via Prometheus federation.
+# Also installs the auto-rollback cron on the monitoring server.
+
+# ── Node exporter is managed by docker-compose ────────────────────────────────
+# No separate installation needed — the haiggle-app role's docker-compose stack
+# already includes ghcr.io/prom/node-exporter on port 9100.
+
+- name: Open node-exporter port for monitoring server only (UFW)
+  community.general.ufw:
+    rule: allow
+    src: "{{ monitoring_server_ip }}"
+    port: "9100"
+    proto: tcp
+    comment: "Prometheus scrape from monitoring server"
+  when: monitoring_server_ip is defined
+
+- name: Create /etc/haiggle directory for school metadata
+  ansible.builtin.file:
+    path: /etc/haiggle
+    state: directory
+    mode: "0755"
+
+- name: Write school metadata for Prometheus labels
+  ansible.builtin.copy:
+    dest: /etc/haiggle/school-meta.yml
+    content: |
+      school_id: "{{ school_id }}"
+      school_name: "{{ school_name | default(inventory_hostname) }}"
+      deploy_group: "{{ group_names | select('match', 'canary') | list | length > 0 | ternary('canary', 'production') }}"
+    mode: "0644"
+
+- name: Register host in Prometheus file SD on monitoring server
+  ansible.builtin.template:
+    src: prometheus-target.json.j2
+    dest: "/etc/prometheus/file_sd/{{ inventory_hostname }}.json"
+    mode: "0644"
+  delegate_to: "{{ monitoring_server_ip }}"
+  when: monitoring_server_ip is defined
+  notify: Reload Prometheus
+
+- name: Deploy auto-rollback script to monitoring server
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../scripts/auto-rollback.sh"
+    dest: /opt/haiggle-fleet/scripts/auto-rollback.sh
+    owner: root
+    group: root
+    mode: "0750"
+  delegate_to: "{{ monitoring_server_ip }}"
+  when:
+    - monitoring_server_ip is defined
+    - inventory_hostname == ansible_play_hosts[0]   # run once
+
+- name: Install auto-rollback cron (every 5 minutes) on monitoring server
+  ansible.builtin.cron:
+    name: haiggle-auto-rollback
+    job: >
+      MONITORING_REDIS_HOST=127.0.0.1
+      ANSIBLE_INVENTORY=/opt/haiggle-fleet/inventory/schools.yml
+      ANSIBLE_VAULT_PASS=/opt/haiggle-fleet/.vault-pass
+      /opt/haiggle-fleet/scripts/auto-rollback.sh >> /var/log/haiggle-auto-rollback.log 2>&1
+    minute: "*/5"
+    user: root
+  delegate_to: "{{ monitoring_server_ip }}"
+  when:
+    - monitoring_server_ip is defined
+    - inventory_hostname == ansible_play_hosts[0]   # run once
+
+handlers:
+  - name: Reload Prometheus
+    ansible.builtin.uri:
+      url: "http://{{ monitoring_server_ip }}:9090/-/reload"
+      method: POST
+      status_code: 200
+    delegate_to: "{{ monitoring_server_ip }}"
+    when: monitoring_server_ip is defined

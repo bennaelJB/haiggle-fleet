@@ -1,0 +1,67 @@
+---
+# Haiggle Fleet — sync-ssh-keys.yml
+# Fetch all public keys from the GitHub org's ops-team and push them to
+# authorized_keys on every school VPS. Run whenever a team member is added/removed.
+# Usage: ansible-playbook playbooks/sync-ssh-keys.yml
+
+- name: Sync SSH keys from GitHub org team to all school VPSes
+  hosts: production:canary:staging
+  become: true
+  gather_facts: false
+
+  vars:
+    github_org: "{{ lookup('env', 'GITHUB_ORG') }}"
+    github_team: "{{ lookup('env', 'GITHUB_OPS_TEAM') | default('ops') }}"
+    github_token: "{{ lookup('env', 'GITHUB_TOKEN') }}"
+    deploy_user: deploy
+
+  tasks:
+    - name: Fetch team member list from GitHub API
+      ansible.builtin.uri:
+        url: "https://api.github.com/orgs/{{ github_org }}/teams/{{ github_team }}/members"
+        headers:
+          Authorization: "Bearer {{ github_token }}"
+          Accept: application/vnd.github+json
+        return_content: true
+      register: team_members
+      delegate_to: localhost
+      run_once: true
+
+    - name: Fetch public keys for each team member
+      ansible.builtin.uri:
+        url: "https://api.github.com/users/{{ item.login }}/keys"
+        headers:
+          Authorization: "Bearer {{ github_token }}"
+          Accept: application/vnd.github+json
+        return_content: true
+      register: member_keys
+      loop: "{{ team_members.json }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Aggregate all public keys into a single list
+      ansible.builtin.set_fact:
+        all_public_keys: >-
+          {{
+            member_keys.results
+            | map(attribute='json')
+            | flatten
+            | map(attribute='key')
+            | list
+          }}
+      delegate_to: localhost
+      run_once: true
+
+    - name: Ensure deploy user exists
+      ansible.builtin.user:
+        name: "{{ deploy_user }}"
+        shell: /bin/bash
+        create_home: true
+        state: present
+
+    - name: Write authorized_keys for deploy user
+      ansible.posix.authorized_key:
+        user: "{{ deploy_user }}"
+        key: "{{ all_public_keys | join('\n') }}"
+        exclusive: true   # Remove any keys NOT in the current team list
+        state: present

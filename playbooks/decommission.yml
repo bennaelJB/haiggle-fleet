@@ -1,0 +1,98 @@
+---
+# Haiggle Fleet — decommission.yml
+# Stop services, remove containers and volumes, deregister from HMP.
+# Usage: ansible-playbook playbooks/decommission.yml -e "school=ccf"
+# WARNING: This is destructive. Ensure a final backup has been taken first.
+
+- name: Decommission a school instance
+  hosts: "{{ school }}"
+  become: true
+  gather_facts: false
+
+  pre_tasks:
+    - name: Confirm decommission (safety check)
+      ansible.builtin.pause:
+        prompt: |
+          You are about to decommission {{ inventory_hostname }} ({{ school_domain }}).
+          This will PERMANENTLY DELETE all containers, volumes, and data on this host.
+          Type the school ID to confirm: {{ school_id }}
+      register: confirm
+      failed_when: confirm.user_input != school_id
+
+  tasks:
+    - name: Stop all Haiggle containers
+      community.docker.docker_compose_v2:
+        project_src: /srv/haiggle
+        state: absent
+        remove_volumes: false   # Volumes removed separately after backup
+      ignore_errors: true
+
+    - name: Take final database backup before volume removal
+      ansible.builtin.command:
+        cmd: >
+          docker run --rm
+          --network haiggle
+          -e PGPASSWORD={{ db_password }}
+          -v /srv/haiggle/backups:/backups
+          postgres:16-alpine
+          pg_dump -h db -U haiggle {{ db_name }} -f /backups/final-backup-{{ ansible_date_time.date }}.sql
+      ignore_errors: true
+
+    - name: Remove Docker volumes
+      community.docker.docker_volume:
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - haiggle_pgdata
+        - haiggle_redisdata
+        - haiggle_miniodata
+        - haiggle_storage
+        - haiggle_logs
+
+    - name: Remove /srv/haiggle directory
+      ansible.builtin.file:
+        path: /srv/haiggle
+        state: absent
+
+    - name: Remove Nginx site configuration
+      ansible.builtin.file:
+        path: /etc/nginx/sites-available/haiggle
+        state: absent
+
+    - name: Remove Nginx site symlink
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/haiggle
+        state: absent
+      notify: reload nginx
+
+    - name: Deregister instance from HMP
+      ansible.builtin.uri:
+        url: "{{ hmp_api_url }}/api/instances/{{ school_id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ hmp_token }}"
+        status_code: [200, 204, 404]
+      ignore_errors: true
+
+    - name: Remove from Prometheus monitoring (update scrape config)
+      ansible.builtin.lineinfile:
+        path: /etc/prometheus/targets/haiggle-schools.yml
+        regexp: ".*{{ school_domain }}.*"
+        state: absent
+      delegate_to: monitoring_server
+      ignore_errors: true
+
+    - name: Notify Slack — decommission complete
+      community.general.slack:
+        token: "{{ slack_token }}"
+        channel: "#ops"
+        msg: |
+          :x: *Decommissioned*: `{{ school_domain }}` ({{ school_id }})
+          Time: {{ ansible_date_time.iso8601 }}
+      delegate_to: localhost
+
+  handlers:
+    - name: reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded

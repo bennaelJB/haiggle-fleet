@@ -1,0 +1,153 @@
+name: Fleet Deploy
+
+on:
+  # Triggered by the main haiggle repo's release.yml workflow via repository_dispatch
+  repository_dispatch:
+    types: [deploy-release]
+
+  # Allow manual trigger for hotfixes
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (e.g. v1.5.0)"
+        required: true
+      skip_canary:
+        description: "Skip canary monitoring window (hotfix only)"
+        type: boolean
+        default: false
+
+env:
+  IMAGE_TAG: ${{ github.event.client_payload.image_tag || inputs.image_tag }}
+  SKIP_CANARY: ${{ github.event.client_payload.skip_canary || inputs.skip_canary || 'false' }}
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # Stage 1 — Canary Deploy
+  # Deploy to canary schools first and monitor for 30 minutes.
+  # ────────────────────────────────────────────────────────────────────────────
+  canary-deploy:
+    name: Deploy to canary schools
+    runs-on: ubuntu-latest
+    environment: canary
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python + Ansible
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ansible ansible-lint
+
+      - name: Write Ansible vault password
+        run: echo "${{ secrets.ANSIBLE_VAULT_PASSWORD }}" > .vault-pass && chmod 600 .vault-pass
+
+      - name: Write SSH private key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 $(ansible-inventory -i inventory/schools.yml --list | python3 -c "
+            import sys, json
+            inv = json.load(sys.stdin)
+            print(' '.join(inv.get('canary', {}).get('hosts', {}).keys()))
+          ") >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Deploy to canary schools
+        run: |
+          ansible-playbook \
+            -i inventory/schools.yml \
+            --vault-password-file .vault-pass \
+            --limit canary \
+            -e "image_tag=${{ env.IMAGE_TAG }}" \
+            playbooks/deploy.yml
+
+      - name: Notify Slack — canary deployed
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_OPS }}
+          slack-message: |
+            :canary: *Canary deployed*: `${{ env.IMAGE_TAG }}`
+            Monitoring for 30 minutes before full fleet rollout...
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Monitor canary (30 min — poll Prometheus error rate)
+        if: env.SKIP_CANARY != 'true'
+        run: |
+          python3 scripts/monitor-canary.py \
+            --prometheus-url "${{ secrets.PROMETHEUS_URL }}" \
+            --duration-minutes 30 \
+            --poll-interval 60 \
+            --error-threshold 0.02
+        env:
+          PROMETHEUS_TOKEN: ${{ secrets.PROMETHEUS_TOKEN }}
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Stage 2 — Manual Approval Gate
+  # A human must approve before the full fleet receives the update.
+  # ────────────────────────────────────────────────────────────────────────────
+  approve-full-fleet:
+    name: Approve full fleet rollout
+    runs-on: ubuntu-latest
+    needs: canary-deploy
+    environment: production   # Requires reviewer approval in GitHub Settings
+
+    steps:
+      - name: Full fleet rollout approved
+        run: echo "Approved by ${{ github.actor }} — proceeding with fleet deploy"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Stage 3 — Full Fleet Deploy
+  # Roll out to all production schools serially (5 at a time).
+  # ────────────────────────────────────────────────────────────────────────────
+  fleet-deploy:
+    name: Deploy to full fleet
+    runs-on: ubuntu-latest
+    needs: approve-full-fleet
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python + Ansible
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ansible
+
+      - name: Write Ansible vault password
+        run: echo "${{ secrets.ANSIBLE_VAULT_PASSWORD }}" > .vault-pass && chmod 600 .vault-pass
+
+      - name: Write SSH private key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: Deploy to full production fleet (serial 5)
+        run: |
+          ansible-playbook \
+            -i inventory/schools.yml \
+            --vault-password-file .vault-pass \
+            --limit production \
+            -e "image_tag=${{ env.IMAGE_TAG }}" \
+            -e "serial=5" \
+            playbooks/deploy.yml
+
+      - name: Run fleet health check post-deploy
+        run: |
+          ansible-playbook \
+            -i inventory/schools.yml \
+            --vault-password-file .vault-pass \
+            --limit production:canary \
+            playbooks/health-check.yml
+
+      - name: Post fleet health report to Slack
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_OPS }}
+          slack-message: |
+            :white_check_mark: *Fleet deploy complete*: `${{ env.IMAGE_TAG }}`
+            All schools updated and health checks passing.
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

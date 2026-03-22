@@ -1,0 +1,46 @@
+---
+# Haiggle Fleet — health-check.yml
+# Poll /api/health on all production instances and report failures.
+# Triggered by monitoring server cron every 5 minutes.
+# Usage: ansible-playbook playbooks/health-check.yml
+
+- name: Fleet health check
+  hosts: production:canary
+  become: false
+  gather_facts: false
+
+  tasks:
+    - name: Check /api/health endpoint
+      ansible.builtin.uri:
+        url: "https://{{ school_domain }}/api/health"
+        method: GET
+        status_code: 200
+        timeout: 10
+        validate_certs: true
+      register: health
+      ignore_errors: true
+
+    - name: Mark unhealthy instances in monitoring Redis
+      ansible.builtin.command:
+        cmd: "redis-cli -h {{ monitoring_redis_host }} SADD deploy:failed {{ inventory_hostname }}"
+      delegate_to: localhost
+      when: health.status is not defined or health.status != 200
+      changed_when: true
+
+    - name: Send Slack alert for unhealthy instance
+      community.general.slack:
+        token: "{{ slack_token }}"
+        channel: "#alerts"
+        msg: |
+          :red_circle: *School offline*: `{{ school_domain }}` — health check failed
+          Last status: {{ health.status | default('no response') }}
+      delegate_to: localhost
+      when: health.status is not defined or health.status != 200
+      run_once: false
+
+    - name: Remove healthy instances from failed set
+      ansible.builtin.command:
+        cmd: "redis-cli -h {{ monitoring_redis_host }} SREM deploy:failed {{ inventory_hostname }}"
+      delegate_to: localhost
+      when: health.status is defined and health.status == 200
+      changed_when: true

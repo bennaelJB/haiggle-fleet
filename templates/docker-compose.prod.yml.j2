@@ -1,0 +1,187 @@
+---
+# Jinja2 template — rendered per school by Ansible provision.yml
+# Variables supplied via inventory/schools.yml and group_vars/
+
+version: "3.9"
+
+services:
+
+  app:
+    image: "{{ docker_image }}:{{ image_tag | default('latest') }}"
+    container_name: haiggle-app
+    restart: unless-stopped
+    env_file: /srv/haiggle/.env
+    volumes:
+      - storage:/var/www/html/storage/app
+      - logs:/var/www/html/storage/logs
+    depends_on:
+      - db
+      - redis
+      - minio
+    networks:
+      - haiggle
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:{{ app_port }}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  app-next:
+    # Blue-green slot — only active during deploys; stopped after cutover.
+    image: "{{ docker_image }}:{{ new_image_tag | default('') }}"
+    container_name: haiggle-app-next
+    restart: no
+    env_file: /srv/haiggle/.env
+    volumes:
+      - storage:/var/www/html/storage/app
+      - logs:/var/www/html/storage/logs
+    depends_on:
+      - db
+      - redis
+      - minio
+    networks:
+      - haiggle
+    profiles:
+      - deploy   # Only started explicitly during the deploy playbook
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:{{ app_port }}/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  queue:
+    image: "{{ docker_image }}:{{ image_tag | default('latest') }}"
+    container_name: haiggle-queue
+    restart: unless-stopped
+    command: php artisan queue:work --sleep=3 --tries=3 --max-time=3600
+    env_file: /srv/haiggle/.env
+    volumes:
+      - storage:/var/www/html/storage/app
+      - logs:/var/www/html/storage/logs
+    depends_on:
+      - db
+      - redis
+    networks:
+      - haiggle
+
+  scheduler:
+    image: "{{ docker_image }}:{{ image_tag | default('latest') }}"
+    container_name: haiggle-scheduler
+    restart: unless-stopped
+    command: >
+      sh -c "while true; do php artisan schedule:run --verbose --no-interaction; sleep 60; done"
+    env_file: /srv/haiggle/.env
+    depends_on:
+      - db
+      - redis
+    networks:
+      - haiggle
+
+  db:
+    image: postgres:16-alpine
+    container_name: haiggle-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "{{ db_name }}"
+      POSTGRES_USER: haiggle
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - haiggle
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "haiggle"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pgbouncer:
+    image: bitnami/pgbouncer:1.22
+    container_name: haiggle-pgbouncer
+    restart: unless-stopped
+    environment:
+      POSTGRESQL_HOST: db
+      POSTGRESQL_PORT: 5432
+      POSTGRESQL_DATABASE: "{{ db_name }}"
+      POSTGRESQL_USERNAME: haiggle
+      POSTGRESQL_PASSWORD_FILE: /run/secrets/db_password
+      PGBOUNCER_PORT: 6432
+      PGBOUNCER_MAX_CLIENT_CONN: "200"
+      PGBOUNCER_DEFAULT_POOL_SIZE: "20"
+      PGBOUNCER_POOL_MODE: transaction
+    secrets:
+      - db_password
+    depends_on:
+      - db
+    networks:
+      - haiggle
+
+  redis:
+    image: redis:7-alpine
+    container_name: haiggle-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass "{{ redis_password }}"
+    volumes:
+      - redisdata:/data
+    networks:
+      - haiggle
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "{{ redis_password }}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  minio:
+    image: minio/minio:latest
+    container_name: haiggle-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "{{ minio_root_user }}"
+      MINIO_ROOT_PASSWORD: "{{ minio_root_password }}"
+    volumes:
+      - miniodata:/data
+    networks:
+      - haiggle
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: haiggle-node-exporter
+    restart: unless-stopped
+    ports:
+      - "{{ node_exporter_port }}:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - haiggle
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  storage:
+  logs:
+
+secrets:
+  db_password:
+    file: /srv/haiggle/secrets/db_password
+
+networks:
+  haiggle:
+    driver: bridge

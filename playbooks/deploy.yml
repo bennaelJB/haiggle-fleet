@@ -1,0 +1,135 @@
+---
+# Haiggle Fleet — deploy.yml
+# Zero-downtime blue-green deploy using Docker + Nginx upstream swap.
+# Usage: ansible-playbook playbooks/deploy.yml -e "image_tag=v1.5.0" [--limit canary]
+#
+# Strategy:
+#   1. Pull new image to all target hosts in parallel
+#   2. Run migrations in a temporary ephemeral container (abort on failure)
+#   3. Start app-next container (new version, different container name)
+#   4. Health-check app-next until healthy (30s timeout)
+#   5. Swap Nginx upstream from haiggle-app to haiggle-app-next
+#   6. Stop old haiggle-app container and rename app-next → app
+#   7. Verify /health returns 200 post-swap
+#   8. Auto-rollback if health check fails
+
+- name: Deploy Haiggle to fleet
+  hosts: "{{ target | default('production') }}"
+  become: true
+  serial: "{{ serial | default(5) }}"
+  max_fail_percentage: 20   # Abort fleet deploy if > 20% of hosts fail
+
+  vars:
+    app_dir: /srv/haiggle
+    image_tag: "{{ image_tag }}"       # Required — passed via -e or CI
+    new_image: "{{ docker_image }}:{{ image_tag }}"
+    health_url: "https://{{ school_domain }}/api/health"
+    health_retries: 12
+    health_delay: 5
+
+  tasks:
+    - name: Pull new image
+      community.docker.docker_image:
+        name: "{{ docker_image }}"
+        tag: "{{ image_tag }}"
+        source: pull
+        force_source: true
+
+    - name: Run database migrations (ephemeral container — abort on failure)
+      community.docker.docker_container:
+        name: haiggle-migrate-{{ image_tag | replace('.', '-') }}
+        image: "{{ new_image }}"
+        command: php artisan migrate --force --no-interaction
+        env_file: "{{ app_dir }}/.env"
+        networks:
+          - name: haiggle
+        detach: false
+        cleanup: true
+        state: started
+      register: migration_result
+      failed_when: migration_result.container.State.ExitCode != 0
+
+    - name: Start app-next container
+      community.docker.docker_container:
+        name: haiggle-app-next
+        image: "{{ new_image }}"
+        env_file: "{{ app_dir }}/.env"
+        volumes:
+          - haiggle_storage:/var/www/html/storage/app
+          - haiggle_logs:/var/www/html/storage/logs
+        networks:
+          - name: haiggle
+        restart_policy: unless-stopped
+        state: started
+
+    - name: Wait for app-next to become healthy
+      ansible.builtin.command:
+        cmd: "docker inspect --format='{{ '{{' }}.State.Health.Status{{ '}}' }}' haiggle-app-next"
+      register: health_status
+      retries: "{{ health_retries }}"
+      delay: "{{ health_delay }}"
+      until: health_status.stdout == "healthy"
+      changed_when: false
+
+    - name: Swap Nginx upstream to app-next (zero-downtime cutover)
+      ansible.builtin.template:
+        src: nginx-upstream-next.conf.j2
+        dest: /etc/nginx/conf.d/haiggle-upstream.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: reload nginx
+
+    - name: Flush handlers (apply Nginx reload immediately)
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify health after cutover
+      ansible.builtin.uri:
+        url: "{{ health_url }}"
+        status_code: 200
+        validate_certs: true
+      register: post_cutover_health
+      retries: 6
+      delay: 5
+      until: post_cutover_health.status == 200
+      rescue:
+        - name: ROLLBACK — health check failed post-cutover
+          ansible.builtin.include_tasks: rollback-tasks.yml
+
+    - name: Stop and remove old app container
+      community.docker.docker_container:
+        name: haiggle-app
+        state: absent
+
+    - name: Rename app-next to app
+      ansible.builtin.command: docker rename haiggle-app-next haiggle-app
+      changed_when: true
+
+    - name: Update Nginx upstream to final app container name
+      ansible.builtin.template:
+        src: nginx.conf.j2
+        dest: /etc/nginx/sites-available/haiggle
+        owner: root
+        group: root
+        mode: "0644"
+      notify: reload nginx
+
+    - name: Record deployed version
+      ansible.builtin.copy:
+        content: "{{ image_tag }}"
+        dest: "{{ app_dir }}/.deployed-version"
+        mode: "0644"
+
+    - name: Notify Slack — deploy success
+      community.general.slack:
+        token: "{{ slack_token }}"
+        channel: "#ops"
+        msg: |
+          :rocket: *Deployed* `{{ image_tag }}` to `{{ inventory_hostname }}` ({{ school_domain }})
+      when: slack_token is defined
+
+  handlers:
+    - name: reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded

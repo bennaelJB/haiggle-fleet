@@ -1,0 +1,32 @@
+---
+# Haiggle Fleet — migrate.yml
+# Run database migrations only — no container restart.
+# Use for forward-compatible schema changes (ADD COLUMN with DEFAULT, CREATE INDEX CONCURRENTLY).
+# Usage: ansible-playbook playbooks/migrate.yml -e "image_tag=v1.5.0" [--limit school_ccf]
+
+- name: Run migrations without restarting the app
+  hosts: "{{ target | default('production') }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    image_tag: "{{ image_tag }}"
+
+  tasks:
+    - name: Run migrations in an ephemeral container
+      community.docker.docker_container:
+        name: haiggle-migrate-{{ image_tag | replace('.', '-') }}
+        image: "{{ docker_image }}:{{ image_tag }}"
+        command: php artisan migrate --force --no-interaction
+        env_file: /srv/haiggle/.env
+        networks:
+          - name: haiggle
+        detach: false
+        cleanup: true
+        state: started
+      register: result
+      failed_when: result.container.State.ExitCode != 0
+
+    - name: Report migration output
+      ansible.builtin.debug:
+        msg: "{{ result.container.Output }}"
