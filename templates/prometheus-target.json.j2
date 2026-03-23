@@ -1,0 +1,11 @@
+[
+  {
+    "targets": ["{{ ansible_host }}:9100"],
+    "labels": {
+      "school_id":     "{{ school_id }}",
+      "school_name":   "{{ school_name | default(inventory_hostname) }}",
+      "deploy_group":  "{{ 'canary' if inventory_hostname in groups.get('canary', []) else 'production' }}",
+      "instance":      "{{ ansible_host }}:9100"
+    }
+  }
+]

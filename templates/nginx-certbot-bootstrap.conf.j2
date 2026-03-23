@@ -1,0 +1,20 @@
+# Temporary HTTP-only vhost — used ONLY to complete the Let's Encrypt
+# ACME challenge before the SSL certificate exists.
+# Ansible replaces this file with nginx.conf.j2 after certbot succeeds.
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{ school_domain }};
+
+    # ACME challenge webroot (Certbot looks here for .well-known/acme-challenge/)
+    location /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        allow all;
+    }
+
+    # Block everything else during bootstrap
+    location / {
+        return 503;
+    }
+}
