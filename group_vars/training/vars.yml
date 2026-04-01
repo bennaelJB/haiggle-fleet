@@ -1,0 +1,39 @@
+---
+# group_vars/training/vars.yml
+# Applied to all hosts in the [training] inventory group.
+# Overrides production defaults for the permanent training instance.
+
+# ── App behaviour ─────────────────────────────────────────────────────────────
+is_training: true
+app_plan: growth               # Full-featured plan so trainers can explore everything
+
+# ── Mail: never send real emails in training ──────────────────────────────────
+mail_mailer: log               # Writes emails to Laravel log instead of sending
+mail_from_address: "training@haiggle.com"
+mail_from_name: "Haiggle Training"
+
+# ── Skip production-only steps ───────────────────────────────────────────────
+skip_hmp: false                # Register with HMP so the training license is valid
+skip_certbot: false            # Real SSL — training.haiggle.com has a valid cert
+
+# ── Cron: daily reset at 03:00 AM server time ────────────────────────────────
+training_reset_cron_hour: "3"
+training_reset_cron_minute: "0"
+training_reset_log: /var/log/haiggle-training-reset.log
+
+# ── Snapshot paths ────────────────────────────────────────────────────────────
+training_snapshot_path: /srv/haiggle/snapshots/training-seed.sql
+training_last_reset_file: /srv/haiggle/snapshots/last-reset.txt
+
+# ── Database ──────────────────────────────────────────────────────────────────
+db_name: haiggle_training
+# db_password: loaded from ansible-vault (group_vars/training/vault.yml)
+# redis_password: loaded from ansible-vault
+
+# ── Domain ────────────────────────────────────────────────────────────────────
+school_domain: training.haiggle.com
+school_id: haiggle-training
+
+# ── Monitoring ────────────────────────────────────────────────────────────────
+# Training instance is monitored but NOT included in production alert thresholds.
+prometheus_alert_group: training

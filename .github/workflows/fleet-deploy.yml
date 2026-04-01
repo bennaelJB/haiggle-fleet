@@ -3,7 +3,7 @@ name: Fleet Deploy
 on:
   # Triggered by the main haiggle repo's release.yml workflow via repository_dispatch
   repository_dispatch:
-    types: [deploy-release]
+    types: [app-release]
 
   # Allow manual trigger for hotfixes
   workflow_dispatch:
@@ -38,6 +38,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install ansible ansible-lint
+
+      - name: Install Ansible Galaxy collections
+        run: ansible-galaxy collection install -r requirements.yml
 
       - name: Write Ansible vault password
         run: echo "${{ secrets.ANSIBLE_VAULT_PASSWORD }}" > .vault-pass && chmod 600 .vault-pass
@@ -114,6 +117,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install ansible
+
+      - name: Install Ansible Galaxy collections
+        run: ansible-galaxy collection install -r requirements.yml
 
       - name: Write Ansible vault password
         run: echo "${{ secrets.ANSIBLE_VAULT_PASSWORD }}" > .vault-pass && chmod 600 .vault-pass

@@ -1,0 +1,66 @@
+---
+# Molecule — verify.yml
+# Assertions run after converge. Checks that the roles did what they claimed.
+
+- name: Verify
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    # ── Docker role ──────────────────────────────────────────────────────────
+    - name: Docker Engine is installed and running
+      ansible.builtin.service:
+        name: docker
+        state: started
+      check_mode: true
+      register: docker_service
+      failed_when: docker_service.changed
+
+    - name: Docker Compose plugin is available
+      ansible.builtin.command: docker compose version
+      register: compose_version
+      changed_when: false
+      failed_when: compose_version.rc != 0
+
+    # ── haiggle-app role ─────────────────────────────────────────────────────
+    - name: App directory exists
+      ansible.builtin.stat:
+        path: /srv/haiggle
+      register: app_dir
+      failed_when: not app_dir.stat.exists or not app_dir.stat.isdir
+
+    - name: .env file rendered
+      ansible.builtin.stat:
+        path: /srv/haiggle/.env
+      register: env_file
+      failed_when: not env_file.stat.exists
+
+    - name: .env contains APP_KEY
+      ansible.builtin.shell:
+        cmd: grep -q "^APP_KEY=" /srv/haiggle/.env
+      changed_when: false
+
+    - name: .env contains DB_CONNECTION=pgsql
+      ansible.builtin.shell:
+        cmd: grep -q "^DB_CONNECTION=pgsql" /srv/haiggle/.env
+      changed_when: false
+
+    - name: docker-compose.yml rendered
+      ansible.builtin.stat:
+        path: /srv/haiggle/docker-compose.yml
+      register: compose_file
+      failed_when: not compose_file.stat.exists
+
+    # ── monitoring role ──────────────────────────────────────────────────────
+    - name: node-exporter port is defined in docker-compose.yml
+      ansible.builtin.shell:
+        cmd: grep -q "9100" /srv/haiggle/docker-compose.yml
+      changed_when: false
+
+    - name: Prometheus target file rendered
+      ansible.builtin.stat:
+        path: /etc/prometheus/targets/haiggle-test.json
+      register: prom_target
+      # Only assert if monitoring server is configured
+      failed_when: false

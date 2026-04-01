@@ -1,0 +1,23 @@
+---
+# Haiggle Fleet — Training Inventory
+# Single permanent training instance at training.haiggle.com
+# Seeded with TrainingDataSeeder. Resets daily at 03:00 AM via cron.
+# Deploy with: make deploy-training tag=<version>
+
+all:
+  vars:
+    deploy_group: training
+    docker_registry: ghcr.io
+    docker_image: ghcr.io/your-org/haiggle
+    is_training: true
+    app_plan: growth       # Full feature access for demo purposes
+    app_env: training
+    mail_mailer: log       # Never send real emails from training
+
+  hosts:
+    training:
+      ansible_host: "{{ lookup('env', 'TRAINING_SERVER_IP') }}"
+      ansible_user: deploy
+      school_id: training
+      school_domain: training.haiggle.com
+      db_name: haiggle_training

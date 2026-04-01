@@ -1,0 +1,21 @@
+---
+# Molecule — converge.yml
+# Runs all roles against the test container (same as provision.yml minus SSL + HMP).
+
+- name: Converge
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    app_dir: /srv/haiggle
+    image_tag: "{{ image_tag | default('latest') }}"
+    # In molecule tests, skip Certbot (no real domain) and HMP registration
+    skip_certbot: "{{ lookup('env', 'SKIP_CERTBOT') | default('true') | bool }}"
+    skip_hmp: "{{ lookup('env', 'SKIP_HMP') | default('true') | bool }}"
+
+  roles:
+    - role: docker
+    - role: haiggle-app
+    - role: monitoring
+    # nginx role is tested separately in molecule/nginx scenario (needs port 80 available)

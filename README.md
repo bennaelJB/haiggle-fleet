@@ -12,7 +12,10 @@ haiggle-fleet/
 ├── inventory/
 │   ├── schools.yml            # All school hosts (canary + production groups)
 │   ├── staging.yml            # Staging instance
-│   └── training-instances.yml # Temporary training instances (auto-decommissioned)
+│   └── training.yml           # Permanent training instance (training.haiggle.com)
+├── group_vars/
+│   └── training/
+│       └── vars.yml           # Training-specific variables (mail: log, plan: growth)
 ├── playbooks/
 │   ├── provision.yml          # Full VPS provisioning (Docker, Nginx, SSL, app)
 │   ├── deploy.yml             # Blue-green zero-downtime deploy
@@ -21,12 +24,18 @@ haiggle-fleet/
 │   ├── health-check.yml       # Poll /health and report to Redis
 │   ├── sync-ssh-keys.yml      # Sync GitHub team SSH keys to VPSes
 │   ├── decommission.yml       # Remove a school instance (destructive)
-│   └── provision-training.yml # Provision temporary training instance
+│   ├── provision-training.yml # Provision the permanent training instance
+│   └── reset-training.yml     # Restore training DB to seeded baseline
 ├── roles/
 │   ├── docker/                # Docker Engine + Compose plugin
 │   ├── nginx/                 # Nginx + Let's Encrypt (Certbot)
 │   ├── haiggle-app/           # App directory, .env, migrations, storage link
 │   └── monitoring/            # node-exporter, Prometheus registration, auto-rollback cron
+├── molecule/
+│   └── default/               # Default Molecule scenario (Docker-in-Docker)
+│       ├── molecule.yml        # Driver, platforms, provisioner config
+│       ├── converge.yml        # Runs docker + haiggle-app + monitoring roles
+│       └── verify.yml          # Assertions: Docker up, .env rendered, ports open
 ├── templates/
 │   ├── docker-compose.prod.yml.j2
 │   ├── .env.j2
@@ -34,7 +43,8 @@ haiggle-fleet/
 ├── scripts/
 │   ├── monitor-canary.py      # Polls Prometheus during canary window
 │   ├── auto-rollback.sh       # Reads Redis deploy:failed set, triggers rollback
-│   └── decommission-training.sh # Auto-decommissions training instances > 14 days
+│   └── reset-training.sh      # Installed on training VPS as daily 03:00 AM cron
+├── requirements.yml            # Ansible Galaxy collections (community.docker, etc.)
 ├── .github/
 │   └── workflows/
 │       └── fleet-deploy.yml   # 3-stage CI/CD: canary → approval → fleet
@@ -48,10 +58,12 @@ haiggle-fleet/
 | Requirement | Details |
 |---|---|
 | Ansible | `pip install ansible` (≥ 2.15) |
-| Ansible Galaxy collections | `ansible-galaxy collection install community.docker community.general` |
+| Ansible Galaxy collections | `ansible-galaxy collection install -r requirements.yml` |
+| Molecule + Docker driver | `pip install molecule molecule-plugins[docker]` |
 | Vault password | `.vault-pass` file in repo root (gitignored) |
 | SSH key | `~/.ssh/id_ed25519` with access to all VPS hosts |
 | Python 3.10+ | For `scripts/monitor-canary.py` |
+| Docker Desktop | For Molecule local testing (Docker-in-Docker) |
 
 ---
 
@@ -99,8 +111,14 @@ make rollback-school school=ccf version=v1.4.2
 # Provision a new school VPS
 make provision school=ccf tag=v1.5.0
 
-# Provision a temporary training instance
-make provision-training school=ccf
+# Provision the permanent training instance
+make provision-training
+
+# Deploy a new image to training
+make deploy-training tag=v1.5.0
+
+# Restore training DB to seeded baseline (also runs automatically every night at 03:00)
+make reset-training
 
 # Run migrations only (no container restart)
 make migrate tag=v1.5.0
@@ -220,18 +238,106 @@ make provision school=<school_id> tag=v1.5.0
 
 ---
 
-## Training instances
+## Training instance
 
-Temporary training VPSes are provisioned via:
+There is a single permanent training instance at `training.haiggle.com`.
+It is pre-loaded with realistic school data (via `TrainingDataSeeder`) and resets automatically every night at 03:00 AM.
+
+### First-time provisioning
 
 ```bash
-make provision-training school=ccf
+# Provision the VPS, seed data, take snapshot, install cron
+make provision-training
 ```
 
-They are automatically decommissioned after 14 days by `scripts/decommission-training.sh`,
-which runs as a daily cron on the monitoring server.
+`provision-training.yml` does the following:
+1. Runs all standard roles (Docker, Nginx + SSL, haiggle-app, monitoring)
+2. Runs `TrainingDataSeeder` to populate realistic school data
+3. Takes a `pg_dump` snapshot to `/srv/haiggle/snapshots/training-seed.sql`
+4. Installs `scripts/reset-training.sh` as a daily 03:00 AM cron
 
-To override the TTL: `TTL_DAYS=7 /path/to/decommission-training.sh`
+### Nightly reset
+
+`scripts/reset-training.sh` (installed on the training VPS) runs at 03:00 AM:
+1. Terminates active DB connections
+2. Drops and recreates `haiggle_training` database
+3. Restores from the seed snapshot
+4. Flushes all Redis keys (sessions, cache, queues)
+5. Restarts app containers
+6. Verifies `/api/health` returns 200
+7. Writes timestamp to `/srv/haiggle/snapshots/last-reset.txt`
+
+To trigger a manual reset:
+```bash
+make reset-training
+```
+
+### Deploying a new version to training
+
+```bash
+make deploy-training tag=v1.5.0
+```
+
+After deploying a major version change, re-seed and re-snapshot:
+```bash
+make provision-training   # re-runs seeder + updates snapshot
+```
+
+---
+
+## Testing roles locally with Molecule
+
+All Ansible roles can be tested locally using [Molecule](https://ansible.readthedocs.io/projects/molecule/) with the Docker driver.
+No real VPS or SSH key required — roles run inside ephemeral containers.
+
+### Install test dependencies
+
+```bash
+pip install molecule molecule-plugins[docker] ansible-lint
+ansible-galaxy collection install -r requirements.yml
+```
+
+### Run the full test cycle
+
+```bash
+# Full cycle: create container → converge (run roles) → verify → destroy
+make test
+
+# Iterate without destroying the container
+make test-converge     # apply roles
+make test-verify       # run assertions
+make test-login        # open shell inside the test container
+make test-destroy      # tear down when done
+
+# Lint all playbooks and roles
+make lint
+```
+
+### What the default scenario tests
+
+The `molecule/default/` scenario spins up a privileged Ubuntu 22.04 container
+(Docker-in-Docker) and runs the `docker`, `haiggle-app`, and `monitoring` roles against it.
+
+Assertions in `verify.yml`:
+- Docker Engine is installed and the service is running
+- `docker compose version` exits 0
+- `/srv/haiggle/` directory exists
+- `.env` file is rendered with `APP_KEY` and `DB_CONNECTION=pgsql`
+- `docker-compose.yml` is rendered
+- Port `9100` (node-exporter) is referenced in `docker-compose.yml`
+
+> **Note:** The `nginx` role is tested in a separate `molecule/nginx/` scenario because it
+> needs port 80 available and Certbot is skipped (`SKIP_CERTBOT=true`).
+
+### Why Molecule is sufficient for most changes
+
+| What you're changing | Test approach |
+|---|---|
+| Role tasks / templates | `make test` (Molecule) |
+| Playbook logic / conditionals | `make test` (Molecule) |
+| Training provisioning flow | `make test` + inspect container |
+| Real SSL, DNS, HMP licensing | Staging VPS only |
+| Full fleet deploy pipeline | CI/CD against staging |
 
 ---
 

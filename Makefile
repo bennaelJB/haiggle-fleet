@@ -54,11 +54,19 @@ provision: ## Provision a new school VPS (make provision school=ccf tag=v1.5.0)
 		-e "image_tag=$(tag)" \
 		playbooks/provision.yml
 
-provision-training: ## Provision a temporary training instance for a school
-	@test -n "$(school)" || (echo "Usage: make provision-training school=ccf"; exit 1)
-	ansible-playbook $(ANSIBLE_FLAGS) -i inventory/training-instances.yml \
-		-e "school=$(school)" \
+provision-training: ## Provision the permanent training instance (training.haiggle.com)
+	ansible-playbook $(ANSIBLE_FLAGS) -i inventory/training.yml \
 		playbooks/provision-training.yml
+
+deploy-training: ## Deploy a new image to the training instance (make deploy-training tag=v1.5.0)
+	@test -n "$(tag)" || (echo "Usage: make deploy-training tag=v1.5.0"; exit 1)
+	ansible-playbook $(ANSIBLE_FLAGS) -i inventory/training.yml \
+		-e "image_tag=$(tag)" \
+		playbooks/deploy.yml
+
+reset-training: ## Restore training DB to seeded baseline and flush Redis
+	ansible-playbook $(ANSIBLE_FLAGS) -i inventory/training.yml \
+		playbooks/reset-training.yml
 
 decommission: ## Decommission a school instance (DESTRUCTIVE — confirm required)
 	@test -n "$(school)" || (echo "Usage: make decommission school=ccf"; exit 1)
@@ -82,11 +90,32 @@ sync-keys: ## Sync GitHub team SSH keys to all school VPSes
 	ansible-playbook $(ANSIBLE_FLAGS) -i inventory/schools.yml \
 		playbooks/sync-ssh-keys.yml
 
+# ── Testing (Molecule / Docker) ───────────────────────────────────────────────
+test: ## Run full Molecule test cycle (create → converge → verify → destroy)
+	molecule test
+
+test-converge: ## Run roles against test containers without destroying them
+	molecule converge
+
+test-verify: ## Run verify assertions against running test containers
+	molecule verify
+
+test-login: ## Open a shell inside the running test container
+	molecule login
+
+test-destroy: ## Tear down Molecule test containers
+	molecule destroy
+
+lint: ## Lint all playbooks and roles with ansible-lint
+	ansible-lint
+
 # ── Help ──────────────────────────────────────────────────────────────────────
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-25s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: deploy deploy-canary deploy-school deploy-staging rollback rollback-school \
-        provision provision-training decommission health migrate sync-keys help
+        provision provision-training deploy-training reset-training decommission \
+        health migrate sync-keys \
+        test test-converge test-verify test-login test-destroy lint help
 .DEFAULT_GOAL := help

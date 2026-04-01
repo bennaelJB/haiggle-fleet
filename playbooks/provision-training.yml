@@ -1,0 +1,127 @@
+---
+# Haiggle Fleet — provision-training.yml
+# Provisions the single permanent training instance at training.haiggle.com.
+# Run once (or to fully reprovision after a server rebuild).
+#
+# Usage:
+#   make provision-training tag=v1.5.0
+#
+# What this does:
+#   1. Install Docker + Docker Compose plugin
+#   2. Create /srv/haiggle directory structure, generate secrets
+#   3. Render docker-compose.prod.yml and .env (APP_TRAINING=true, MAIL_MAILER=log)
+#   4. Pull the application image
+#   5. Run fresh migrations + TrainingDataSeeder (creates 320 students, 18 teachers, etc.)
+#   6. Take a pg_dump snapshot saved to /srv/haiggle/snapshots/training-seed.sql
+#   7. Configure Nginx + obtain Let's Encrypt SSL certificate
+#   8. Install daily 03:00 AM reset cron (restore snapshot + flush Redis)
+#   9. Register instance in Prometheus monitoring (labelled "Training Environment")
+
+- name: Provision permanent training instance
+  hosts: training
+  become: true
+  gather_facts: true
+
+  vars:
+    app_dir: /srv/haiggle
+    image_tag: "{{ image_tag | default('latest') }}"
+    snapshot_path: /srv/haiggle/snapshots/training-seed.sql
+
+  pre_tasks:
+    - name: Ensure Python3 and pip are present
+      ansible.builtin.package:
+        name: [python3, python3-pip]
+        state: present
+        update_cache: true
+
+    - name: Create snapshots directory
+      ansible.builtin.file:
+        path: /srv/haiggle/snapshots
+        state: directory
+        owner: deploy
+        group: deploy
+        mode: "0750"
+
+  roles:
+    - role: docker
+      tags: [docker]
+
+    - role: haiggle-app
+      tags: [app]
+
+    - role: nginx
+      tags: [nginx]
+
+    - role: monitoring
+      tags: [monitoring]
+
+  post_tasks:
+    - name: Wait for application to become healthy
+      ansible.builtin.uri:
+        url: "https://{{ school_domain }}/api/health"
+        status_code: 200
+        validate_certs: true
+      register: health_check
+      retries: 10
+      delay: 10
+      until: health_check.status == 200
+
+    - name: Seed training data (TrainingDataSeeder)
+      community.docker.docker_container:
+        name: haiggle-seed-training
+        image: "{{ docker_image }}:{{ image_tag }}"
+        command: php artisan db:seed --class=TrainingDataSeeder --force
+        env_file: /srv/haiggle/.env
+        detach: false
+        cleanup: true
+        networks:
+          - name: haiggle_haiggle
+      register: seed_result
+
+    - name: Fail if seeder errored
+      ansible.builtin.fail:
+        msg: "TrainingDataSeeder failed: {{ seed_result.container.Output }}"
+      when: seed_result.container.ExitCode != 0
+
+    - name: Take initial pg_dump snapshot (the daily-reset baseline)
+      community.docker.docker_container:
+        name: haiggle-snapshot
+        image: postgres:16-alpine
+        command: >
+          pg_dump -h db -U haiggle -d {{ db_name }} -f {{ snapshot_path }}
+        env:
+          PGPASSWORD: "{{ db_password }}"
+        volumes:
+          - /srv/haiggle/snapshots:/srv/haiggle/snapshots
+        networks:
+          - name: haiggle_haiggle
+        detach: false
+        cleanup: true
+
+    - name: Install daily 03:00 AM reset cron
+      ansible.builtin.cron:
+        name: haiggle-training-reset
+        user: deploy
+        minute: "0"
+        hour: "3"
+        job: >
+          /srv/haiggle/scripts/reset-training.sh
+          >> /var/log/haiggle-training-reset.log 2>&1
+
+    - name: Upload reset script to training VPS
+      ansible.builtin.copy:
+        src: ../scripts/reset-training.sh
+        dest: /srv/haiggle/scripts/reset-training.sh
+        owner: deploy
+        group: deploy
+        mode: "0750"
+
+    - name: Notify Slack — training instance provisioned
+      community.general.slack:
+        token: "{{ slack_token }}"
+        channel: "#ops"
+        msg: |
+          :school: *Training instance provisioned*: `{{ school_domain }}`
+          Image: `{{ image_tag }}`
+          Daily reset cron: 03:00 AM
+      when: slack_token is defined

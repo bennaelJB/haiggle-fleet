@@ -1,0 +1,73 @@
+---
+# Molecule — default scenario
+# Tests individual roles (docker, nginx, haiggle-app, monitoring) in Docker containers.
+# Simulates a fresh Ubuntu 22.04 VPS without needing a real server.
+#
+# Usage:
+#   molecule test              # full cycle: create → prepare → converge → verify → destroy
+#   molecule converge          # run roles only (keep container alive for iteration)
+#   molecule login             # SSH into the running test container
+#   molecule verify            # run assert playbook against running container
+#   molecule destroy           # tear down containers
+
+dependency:
+  name: galaxy
+  options:
+    requirements-file: requirements.yml
+
+driver:
+  name: docker
+
+platforms:
+  - name: haiggle-test-ubuntu
+    image: geerlingguy/docker-ubuntu2204-ansible:latest
+    pre_build_image: true
+    command: ""
+    privileged: true           # needed for Docker-in-Docker (the role installs Docker)
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - /var/lib/docker           # Docker-in-Docker data volume
+    tmpfs:
+      - /run
+      - /tmp
+    capabilities:
+      - SYS_ADMIN
+    environment:
+      MOLECULE_TESTING: "true"
+      # Skip Certbot SSL in tests — no real domain available
+      SKIP_CERTBOT: "true"
+      # Skip HMP registration in tests
+      SKIP_HMP: "true"
+
+provisioner:
+  name: ansible
+  inventory:
+    host_vars:
+      haiggle-test-ubuntu:
+        school_domain: localhost
+        school_id: test-school
+        db_name: haiggle_test
+        db_password: test_password
+        redis_password: test_redis
+        app_key: base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+        minio_root_user: minioadmin
+        minio_root_password: minioadmin123
+        image_tag: latest
+        app_plan: growth
+        is_training: false
+  options:
+    diff: true
+  config_options:
+    defaults:
+      callbacks_enabled: profile_tasks
+      gathering: smart
+      fact_caching: jsonfile
+      fact_caching_connection: /tmp/molecule-facts
+
+verifier:
+  name: ansible
+
+lint: |
+  set -e
+  ansible-lint

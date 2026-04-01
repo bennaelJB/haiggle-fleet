@@ -1,0 +1,113 @@
+---
+# Haiggle Fleet — reset-training.yml
+# Restores the training instance to its seeded baseline.
+# Called by the daily 03:00 AM cron (via scripts/reset-training.sh) OR manually:
+#
+#   make reset-training
+#
+# What this does:
+#   1. Terminate all active PostgreSQL connections on haiggle_training
+#   2. Drop and recreate the database
+#   3. Restore from /srv/haiggle/snapshots/training-seed.sql
+#   4. Flush all Redis keys (clears sessions, cache, queues)
+#   5. Restart the app container to clear any in-memory state
+#   6. Verify /health returns 200
+
+- name: Reset training instance to seeded baseline
+  hosts: training
+  become: true
+  gather_facts: false
+
+  vars:
+    snapshot_path: /srv/haiggle/snapshots/training-seed.sql
+    db_name: haiggle_training
+
+  tasks:
+    - name: Check snapshot exists
+      ansible.builtin.stat:
+        path: "{{ snapshot_path }}"
+      register: snapshot_stat
+
+    - name: Fail if snapshot is missing
+      ansible.builtin.fail:
+        msg: >
+          Snapshot {{ snapshot_path }} does not exist.
+          Run 'make provision-training' first to create it.
+      when: not snapshot_stat.stat.exists
+
+    - name: Terminate active connections to training database
+      community.docker.docker_container:
+        name: haiggle-reset-terminate
+        image: postgres:16-alpine
+        command: >
+          psql -h db -U haiggle -d postgres -c
+          "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+           WHERE datname = '{{ db_name }}' AND pid <> pg_backend_pid();"
+        env:
+          PGPASSWORD: "{{ db_password }}"
+        networks:
+          - name: haiggle_haiggle
+        detach: false
+        cleanup: true
+
+    - name: Drop and recreate training database
+      community.docker.docker_container:
+        name: haiggle-reset-recreate
+        image: postgres:16-alpine
+        command: >
+          sh -c "
+          dropdb -h db -U haiggle {{ db_name }} &&
+          createdb -h db -U haiggle {{ db_name }}
+          "
+        env:
+          PGPASSWORD: "{{ db_password }}"
+        networks:
+          - name: haiggle_haiggle
+        detach: false
+        cleanup: true
+
+    - name: Restore database from snapshot
+      community.docker.docker_container:
+        name: haiggle-reset-restore
+        image: postgres:16-alpine
+        command: >
+          psql -h db -U haiggle -d {{ db_name }} -f {{ snapshot_path }}
+        env:
+          PGPASSWORD: "{{ db_password }}"
+        volumes:
+          - /srv/haiggle/snapshots:/srv/haiggle/snapshots:ro
+        networks:
+          - name: haiggle_haiggle
+        detach: false
+        cleanup: true
+      register: restore_result
+
+    - name: Fail if restore errored
+      ansible.builtin.fail:
+        msg: "Database restore failed"
+      when: restore_result.container.ExitCode != 0
+
+    - name: Flush Redis (sessions, cache, queues)
+      community.docker.docker_container_exec:
+        container: haiggle-redis
+        command: redis-cli -a "{{ redis_password }}" FLUSHALL
+
+    - name: Restart app container (clear in-memory state)
+      community.docker.docker_container:
+        name: haiggle-app
+        state: started
+        restart: true
+
+    - name: Wait for app to become healthy after restart
+      ansible.builtin.uri:
+        url: "https://{{ school_domain }}/api/health"
+        status_code: 200
+        validate_certs: true
+      register: health
+      retries: 8
+      delay: 10
+      until: health.status == 200
+
+    - name: Log reset timestamp
+      ansible.builtin.shell:
+        cmd: echo "{{ ansible_date_time.iso8601 }}" > /srv/haiggle/snapshots/last-reset.txt
